@@ -22,7 +22,7 @@ jobs:
     env:
       DC_GALLERY_URL: ${{ inputs.gallery_url || vars.DC_GALLERY_URL }}
       # 6시간 강제 종료 전에 암호화/Artifact 업로드 시간을 남기기 위해 5시간 45분에 정상 종료.
-      DC_MONITOR_RUN_SECONDS: '20700'
+      DC_MONITOR_RUN_SECONDS: '18000'
       DC_MONITOR_GITHUB_TOKEN: ${{ github.token }}
       DC_MONITOR_GITHUB_REPOSITORY: ${{ github.repository }}
       DC_MONITOR_STATE_BRANCH: monitor-state
