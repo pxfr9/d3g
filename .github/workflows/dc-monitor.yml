@@ -7,7 +7,8 @@ on:
         description: '감시할 DCInside 갤러리 목록 URL (비우면 Repository variable DC_GALLERY_URL 사용)'
         required: false
         type: string
-
+        default: 'https://gall.dcinside.com/mgallery/board/lists?id=boobs'
+        
 permissions:
   contents: write
 
