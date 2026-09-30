@@ -1,0 +1,132 @@
+name: DC Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      gallery_url:
+        description: '감시할 DCInside 갤러리 목록 URL (비우면 Repository variable DC_GALLERY_URL 사용)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dc-monitor-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DC_GALLERY_URL: ${{ inputs.gallery_url || vars.DC_GALLERY_URL }}
+      # 6시간 강제 종료 전에 암호화/Artifact 업로드 시간을 남기기 위해 5시간 45분에 정상 종료.
+      DC_MONITOR_RUN_SECONDS: '20700'
+      DC_MONITOR_GITHUB_TOKEN: ${{ github.token }}
+      DC_MONITOR_GITHUB_REPOSITORY: ${{ github.repository }}
+      DC_MONITOR_STATE_BRANCH: monitor-state
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Require encryption password
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          if [ -z "$ZIP_PASSWORD" ]; then
+            echo "::error::Repository secret ZIP_PASSWORD가 설정되어 있지 않습니다. 민감한 수집물을 평문으로 남기지 않기 위해 실행을 중단합니다."
+            exit 1
+          fi
+
+      - name: Ensure 7-Zip
+        run: |
+          if ! command -v 7z >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y p7zip-full
+          fi
+
+      # data/를 그대로 GitHub Cache에 저장하지 않고 암호화된 상태 파일만 캐시합니다.
+      - name: Restore encrypted monitor state
+        uses: actions/cache@v6
+        with:
+          path: .dc-monitor-state.7z
+          key: dc-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            dc-monitor-state-
+
+      - name: Decrypt monitor state
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          if [ -f .dc-monitor-state.7z ]; then
+            7z x -y -p"$ZIP_PASSWORD" .dc-monitor-state.7z -o. >/dev/null
+            rm -f .dc-monitor-state.7z
+          fi
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run DC Monitor
+        run: python -u main_github.py
+
+      - name: Encrypt collected files
+        if: always()
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          set -e
+          if [ -z "$ZIP_PASSWORD" ]; then
+            echo "::error::ZIP_PASSWORD가 없어 결과물을 암호화할 수 없습니다."
+            exit 1
+          fi
+
+          items=()
+          [ -d downloads ] && items+=(downloads)
+          [ -d data ] && items+=(data)
+          [ -f Notification.log ] && items+=(Notification.log)
+
+          if [ ${#items[@]} -eq 0 ]; then
+            mkdir -p .empty-result
+            printf '수집된 파일이 없습니다.\n' > .empty-result/README.txt
+            items+=(.empty-result)
+          fi
+
+          # 7z AES-256 + 헤더 암호화(-mhe=on): 파일 내용뿐 아니라 파일명/폴더명도 암호 없이는 보이지 않게 합니다.
+          7z a -t7z -mx=7 -mhe=on -p"$ZIP_PASSWORD" \
+            "dc-monitor-${{ github.run_id }}.7z" "${items[@]}" >/dev/null
+
+          rm -rf .empty-result
+
+      - name: Encrypt monitor state for next run
+        if: always()
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          set -e
+          rm -f .dc-monitor-state.7z
+          if [ -d data ] && [ -n "$ZIP_PASSWORD" ]; then
+            7z a -t7z -mx=5 -mhe=on -p"$ZIP_PASSWORD" .dc-monitor-state.7z data >/dev/null
+          fi
+
+      - name: Remove plaintext collected files from workspace
+        if: always()
+        run: |
+          rm -rf downloads data Notification.log
+
+      - name: Upload encrypted collected files
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dc-monitor-${{ github.run_id }}-encrypted
+          path: dc-monitor-${{ github.run_id }}.7z
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
