@@ -2258,7 +2258,6 @@ def check_tracked_post_comments(
                 key = f"{gallery_id}|{post_id}|{comment_id}|{url}"
                 if key in seen_comment_links:
                     continue
-                save_dir.mkdir(parents=True, exist_ok=True)
                 logger.info("새 댓글 링크 감지: post=%s comment=%s | %s", post_id, comment_id, url)
                 process_comment_url(
                     url, post_url, save_dir, image_hashes, post_budget, image_index,
