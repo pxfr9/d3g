@@ -88,10 +88,14 @@ jobs:
             exit 1
           fi
 
+          # 다운로드 결과에는 downloads/만 포함합니다. data/와 로그는 Artifact에 넣지 않습니다.
+          # 중복/제외 이미지 처리 후 남은 빈 작성자 폴더도 최종적으로 제거합니다.
+          if [ -d downloads ]; then
+            find downloads -depth -type d -empty -delete
+          fi
+
           items=()
           [ -d downloads ] && items+=(downloads)
-          [ -d data ] && items+=(data)
-          [ -f Notification.log ] && items+=(Notification.log)
 
           if [ ${#items[@]} -eq 0 ]; then
             mkdir -p .empty-result
