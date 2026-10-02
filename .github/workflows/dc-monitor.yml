@@ -7,14 +7,9 @@ on:
         description: '감시할 DCInside 갤러리 목록 URL (비우면 Repository variable DC_GALLERY_URL 사용)'
         required: false
         type: string
-        default: 'https://gall.dcinside.com/mgallery/board/lists?id=boobs'
-        
+
 permissions:
   contents: write
-
-concurrency:
-  group: dc-monitor-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   monitor:
@@ -22,7 +17,8 @@ jobs:
     timeout-minutes: 360
     env:
       DC_GALLERY_URL: ${{ inputs.gallery_url || vars.DC_GALLERY_URL }}
-      # 6시간 강제 종료 전에 암호화/Artifact 업로드 시간을 남기기 위해 5시간 45분에 정상 종료.
+      GUESTBOOK_INTEREST_USERS: ${{ vars.GUESTBOOK_INTEREST_USERS }}
+      # 6시간 강제 종료 전에 암호화/Artifact 업로드 시간을 남기기 위해 5시간에 정상 종료.
       DC_MONITOR_RUN_SECONDS: '18000'
       DC_MONITOR_GITHUB_TOKEN: ${{ github.token }}
       DC_MONITOR_GITHUB_REPOSITORY: ${{ github.repository }}
@@ -72,11 +68,304 @@ jobs:
             rm -f .dc-monitor-state.7z
           fi
 
+      - name: Merge latest encrypted shared state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          STATE_BRANCH: monitor-state
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import shutil
+          import subprocess
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          token = os.environ['GH_TOKEN']
+          repo = os.environ['REPOSITORY']
+          branch = os.environ['STATE_BRANCH']
+          password = os.environ['ZIP_PASSWORD']
+          api_root = f'https://api.github.com/repos/{repo}'
+          state_path = '.dc-monitor-state.7z'
+
+          SET_FILES = {
+              'image_hashes.txt',
+              'comment_links.txt',
+              'guestbook_links.txt',
+              'comment_guestbook_triggers.txt',
+              'guestbook_interest_users.txt',
+          }
+
+          def request(method, url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode('utf-8')
+              req = urllib.request.Request(url, data=data, method=method)
+              req.add_header('Accept', 'application/vnd.github+json')
+              req.add_header('Authorization', f'Bearer {token}')
+              req.add_header('X-GitHub-Api-Version', '2022-11-28')
+              req.add_header('User-Agent', 'dc-monitor-state-merge')
+              if data is not None:
+                  req.add_header('Content-Type', 'application/json')
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read()
+
+          def merge_set_file(dst, src):
+              values = set()
+              for path in (dst, src):
+                  if path.exists():
+                      values.update(x.strip() for x in path.read_text(encoding='utf-8', errors='replace').splitlines() if x.strip())
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_text('\n'.join(sorted(values)) + ('\n' if values else ''), encoding='utf-8')
+
+          def merge_external_links(dst, src):
+              header = 'time\tgallery\tpost_id\tauthor\tsource\tcomment_id\tdomain\turl'
+              rows = []
+              seen = set()
+              for path in (dst, src):
+                  if not path.exists():
+                      continue
+                  for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+                      line = line.rstrip('\r\n')
+                      if not line or line == header or line in seen:
+                          continue
+                      seen.add(line)
+                      rows.append(line)
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_text(header + '\n' + ''.join(row + '\n' for row in rows), encoding='utf-8')
+
+          def merge_data(local_data, remote_data):
+              if not remote_data.is_dir():
+                  return
+              local_data.mkdir(parents=True, exist_ok=True)
+              for src in remote_data.rglob('*'):
+                  if not src.is_file():
+                      continue
+                  rel = src.relative_to(remote_data)
+                  dst = local_data / rel
+                  if rel.as_posix() in SET_FILES:
+                      merge_set_file(dst, src)
+                  elif rel.as_posix() == 'external_links.tsv':
+                      merge_external_links(dst, src)
+                  elif not dst.exists():
+                      dst.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(src, dst)
+
+          encoded = urllib.parse.quote(state_path, safe='')
+          url = f'{api_root}/contents/{encoded}?ref={urllib.parse.quote(branch, safe="")}'
+          status, body = request('GET', url)
+          if status == 404:
+              print('원격 암호화 상태 없음: 로컬/캐시 상태로 시작')
+              raise SystemExit(0)
+          if status != 200:
+              raise SystemExit(f'원격 상태 읽기 실패: HTTP {status}')
+
+          meta = json.loads(body.decode('utf-8'))
+          archive_bytes = base64.b64decode(str(meta.get('content') or '').replace('\n', ''))
+          with tempfile.TemporaryDirectory(prefix='dc-state-restore-') as td:
+              td = Path(td)
+              archive = td / 'state.7z'
+              extracted = td / 'extracted'
+              archive.write_bytes(archive_bytes)
+              extracted.mkdir()
+              subprocess.run(
+                  ['7z', 'x', '-y', f'-p{password}', str(archive), f'-o{extracted}'],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+              )
+              merge_data(Path('data'), extracted / 'data')
+              print('최신 원격 암호화 상태를 로컬 상태와 병합했습니다.')
+          PY
+
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
       - name: Run DC Monitor
         run: python -u main_github.py
+
+      - name: Merge and save encrypted shared state
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          STATE_BRANCH: monitor-state
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          token = os.environ['GH_TOKEN']
+          repo = os.environ['REPOSITORY']
+          branch = os.environ['STATE_BRANCH']
+          password = os.environ.get('ZIP_PASSWORD', '')
+          if not password:
+              raise SystemExit('ZIP_PASSWORD가 없어 상태를 암호화할 수 없습니다.')
+
+          api_root = f'https://api.github.com/repos/{repo}'
+          state_path = '.dc-monitor-state.7z'
+          local_data = Path('data')
+
+          SET_FILES = {
+              'image_hashes.txt',
+              'comment_links.txt',
+              'guestbook_links.txt',
+              'comment_guestbook_triggers.txt',
+              'guestbook_interest_users.txt',
+          }
+
+          def request(method, url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode('utf-8')
+              req = urllib.request.Request(url, data=data, method=method)
+              req.add_header('Accept', 'application/vnd.github+json')
+              req.add_header('Authorization', f'Bearer {token}')
+              req.add_header('X-GitHub-Api-Version', '2022-11-28')
+              req.add_header('User-Agent', 'dc-monitor-state-merge')
+              if data is not None:
+                  req.add_header('Content-Type', 'application/json')
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read()
+
+          def ensure_branch():
+              encoded_branch = urllib.parse.quote(branch, safe='')
+              status, _ = request('GET', f'{api_root}/git/ref/heads/{encoded_branch}')
+              if status == 200:
+                  return
+              if status != 404:
+                  raise RuntimeError(f'상태 브랜치 확인 실패: HTTP {status}')
+              status, body = request('GET', api_root)
+              if status != 200:
+                  raise RuntimeError(f'저장소 정보 확인 실패: HTTP {status}')
+              default_branch = json.loads(body.decode('utf-8')).get('default_branch')
+              status, body = request('GET', f'{api_root}/git/ref/heads/{urllib.parse.quote(default_branch, safe="")}')
+              if status != 200:
+                  raise RuntimeError(f'기본 브랜치 확인 실패: HTTP {status}')
+              sha = json.loads(body.decode('utf-8'))['object']['sha']
+              status, _ = request('POST', f'{api_root}/git/refs', {'ref': f'refs/heads/{branch}', 'sha': sha})
+              if status not in (201, 422):
+                  raise RuntimeError(f'상태 브랜치 생성 실패: HTTP {status}')
+
+          def merge_set_file(dst, src):
+              values = set()
+              for path in (dst, src):
+                  if path.exists():
+                      values.update(x.strip() for x in path.read_text(encoding='utf-8', errors='replace').splitlines() if x.strip())
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_text('\n'.join(sorted(values)) + ('\n' if values else ''), encoding='utf-8')
+
+          def merge_external_links(dst, src):
+              header = 'time\tgallery\tpost_id\tauthor\tsource\tcomment_id\tdomain\turl'
+              rows = []
+              seen = set()
+              for path in (src, dst):
+                  if not path.exists():
+                      continue
+                  for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+                      line = line.rstrip('\r\n')
+                      if not line or line == header or line in seen:
+                          continue
+                      seen.add(line)
+                      rows.append(line)
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_text(header + '\n' + ''.join(row + '\n' for row in rows), encoding='utf-8')
+
+          def merge_data(dst_data, src_data):
+              if not src_data.is_dir():
+                  return
+              dst_data.mkdir(parents=True, exist_ok=True)
+              for src in src_data.rglob('*'):
+                  if not src.is_file():
+                      continue
+                  rel = src.relative_to(src_data)
+                  dst = dst_data / rel
+                  if rel.as_posix() in SET_FILES:
+                      merge_set_file(dst, src)
+                  elif rel.as_posix() == 'external_links.tsv':
+                      merge_external_links(dst, src)
+                  elif not dst.exists():
+                      dst.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(src, dst)
+
+          def fetch_remote_state(tmpdir):
+              encoded = urllib.parse.quote(state_path, safe='')
+              url = f'{api_root}/contents/{encoded}?ref={urllib.parse.quote(branch, safe="")}'
+              status, body = request('GET', url)
+              if status == 404:
+                  return None, None
+              if status != 200:
+                  raise RuntimeError(f'원격 상태 읽기 실패: HTTP {status}')
+              meta = json.loads(body.decode('utf-8'))
+              archive = tmpdir / 'remote.7z'
+              archive.write_bytes(base64.b64decode(str(meta.get('content') or '').replace('\n', '')))
+              extracted = tmpdir / 'remote-extracted'
+              extracted.mkdir()
+              subprocess.run(
+                  ['7z', 'x', '-y', f'-p{password}', str(archive), f'-o{extracted}'],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+              )
+              return extracted / 'data', str(meta.get('sha') or '') or None
+
+          def make_archive(tmpdir):
+              archive = tmpdir / 'merged.7z'
+              if archive.exists():
+                  archive.unlink()
+              if not local_data.is_dir():
+                  local_data.mkdir(parents=True, exist_ok=True)
+              subprocess.run(
+                  ['7z', 'a', '-t7z', '-mx=5', '-mhe=on', f'-p{password}', str(archive), 'data'],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+              )
+              return archive
+
+          ensure_branch()
+          encoded = urllib.parse.quote(state_path, safe='')
+          put_url = f'{api_root}/contents/{encoded}'
+
+          for attempt in range(6):
+              with tempfile.TemporaryDirectory(prefix='dc-state-save-') as td_raw:
+                  td = Path(td_raw)
+                  remote_data, remote_sha = fetch_remote_state(td)
+                  if remote_data is not None:
+                      merge_data(local_data, remote_data)
+                  archive = make_archive(td)
+                  payload = {
+                      'message': 'Merge encrypted DC Monitor state',
+                      'content': base64.b64encode(archive.read_bytes()).decode('ascii'),
+                      'branch': branch,
+                  }
+                  if remote_sha:
+                      payload['sha'] = remote_sha
+                  status, _ = request('PUT', put_url, payload)
+                  if status in (200, 201):
+                      print('공용 상태 병합 저장 완료')
+                      break
+                  if status in (409, 422) and attempt < 5:
+                      print(f'동시 상태 갱신 충돌 감지(HTTP {status}) - 최신 상태를 다시 병합합니다.')
+                      time.sleep(0.5 * (attempt + 1))
+                      continue
+                  raise SystemExit(f'공용 상태 저장 실패: HTTP {status}')
+          PY
 
       - name: Encrypt collected files
         if: always()
