@@ -62,6 +62,7 @@ MAX_EXTERNAL_IMAGES_PER_PAGE = int(os.getenv('MAX_EXTERNAL_IMAGES_PER_PAGE', '30
 MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', str(20 * 1024 * 1024)))
 MAX_POST_BYTES = int(os.getenv('MAX_POST_BYTES', str(200 * 1024 * 1024)))
 HTTP_TIMEOUT = int(os.getenv('HTTP_TIMEOUT', '10'))
+EXTERNAL_REQUEST_INTERVAL_SECONDS = max(0.1, float(os.getenv('EXTERNAL_REQUEST_INTERVAL_SECONDS', '2')))
 
 # 게시글 영상 인코딩 지연 대응: 2초 간격, 최대 60초
 VIDEO_RETRY_INTERVAL_SECONDS = max(1.0, float(os.getenv('VIDEO_RETRY_INTERVAL_SECONDS', '2')))
@@ -84,7 +85,6 @@ GUESTBOOK_LEGACY_USERS = {
 
 _default_guestbook_hints = [
     '방명록', 'ㅂㅁㄹ', '갤로그', '갤록',
-    '방명 와여', '방명 와요', '방명와여', '방명와요',
     '원본 올림', '원본 올려둠', '링크 올림', '링크 올려둠',
     '링크 올렸', '링크 줌', '링크 주세요', '링크 공유', '링크 있음',
     '링크 여기', '링크 받', '링크 달라', '링크 부탁',
@@ -136,6 +136,8 @@ GUESTBOOK_LINK_FILE = DATA_DIR / 'guestbook_links.txt'
 COMMENT_GUESTBOOK_TRIGGER_FILE = DATA_DIR / 'comment_guestbook_triggers.txt'
 GUESTBOOK_INTEREST_FILE = DATA_DIR / 'guestbook_interest_users.txt'
 EXTERNAL_LINK_LOG_FILE = DATA_DIR / 'external_links.tsv'
+BLOCKED_TITLE_WORDS_FILE = DATA_DIR / 'blocked_title_words.txt'
+BLOCKED_BODY_WORDS_FILE = DATA_DIR / 'blocked_body_words.txt'
 
 # PC ↔ GitHub Actions 공용 이미지 SHA-256 동기화.
 # 최초 1회 Windows 환경변수에 토큰/저장소를 지정하면 이후 자동으로 동기화한다.
@@ -377,6 +379,33 @@ def _wait_for_gallery_slot(active=lambda: True) -> bool:
             break
         time.sleep(min(0.1, remaining))
     return bool(active())
+
+def _reserve_external_request() -> float:
+    """외부사이트 HTTP 요청 시작 시각을 PC의 여러 수집기끼리도 공유해 분산한다."""
+    path = SHARED_DIR / 'external_reservation.json'
+    with _file_lock(SHARED_DIR / 'external_reservation.lock'):
+        state = _shared_read(path)
+        now = time.time()
+        next_slot = float(state.get('next_slot', 0))
+        # 비정상 종료/시계 변경으로 오래된 예약이 남은 경우 폐기한다.
+        if next_slot - now > max(60.0, EXTERNAL_REQUEST_INTERVAL_SECONDS * 10):
+            next_slot = now
+        slot = max(now, next_slot)
+        _shared_write(path, {'next_slot': slot + EXTERNAL_REQUEST_INTERVAL_SECONDS})
+        return max(0.0, slot - now)
+
+
+def _wait_for_external_slot() -> None:
+    delay = _reserve_external_request()
+    if delay <= 0:
+        return
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+
 
 def _mark_external_failure(exc: Exception) -> None:
     if not getattr(_external_request_context, 'active', False):
@@ -641,6 +670,33 @@ def sync_image_hashes_with_github(hashes: set[str]) -> bool:
         logger.warning('PC↔GitHub 이미지 해시 동기화 실패: HTTP %s', status)
         return False
     return False
+
+def load_blocked_words(path: Path) -> tuple[str, ...]:
+    """차단 단어 파일을 시작 시 한 번만 읽는다. 빈 줄과 # 주석은 무시한다."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        return tuple()
+    words: list[str] = []
+    seen: set[str] = set()
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        value = raw.strip()
+        if not value or value.startswith("#"):
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        words.append(value)
+    return tuple(words)
+
+
+def find_blocked_word(text: str, words: tuple[str, ...]) -> str | None:
+    haystack = str(text or "").casefold()
+    for word in words:
+        if word.casefold() in haystack:
+            return word
+    return None
+
 
 def load_image_hashes() -> set[str]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1067,6 +1123,9 @@ def safe_get(url: str, *, referer: str | None = None, timeout: int | float = HTT
             raise requests.RequestException(f"비공개/사설 주소 요청 차단: {current}")
 
         try:
+            current_host = (urlparse(current).hostname or "").lower()
+            if not is_dcinside_host(current_host):
+                _wait_for_external_slot()
             resp = get_session().get(
                 current,
                 headers=headers or None,
@@ -1498,74 +1557,110 @@ def check_tracked_post_videos(
             )
             tracked_posts.pop(post_id, None)
 
-def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
-    """외부 페이지에서 '콘텐츠로 볼 근거가 강한' 이미지만 수집한다.
+def collect_external_page_media(page_url: str, post_url: str) -> tuple[list[str], list[str]]:
+    """외부 페이지에서 콘텐츠 근거가 강한 이미지/영상 URL만 수집한다.
 
-    사이트 로고/버튼/닉네임 아이콘 같은 모든 <img>를 훑지 않는다.
-    - og:image / twitter:image
-    - rel=image_src
-    - 이미지 파일로 직접 연결되는 <a href>
-    만 대상으로 한다.
+    이미지: og:image / twitter:image / rel=image_src / 이미지 직링크
+    영상: og:video / twitter:player:stream / video/source / 영상 직링크
+    사이트 로고·버튼 같은 일반 UI 이미지는 기존처럼 훑지 않는다.
     """
     if not is_public_http_url(page_url):
-        return []
+        return [], []
 
     try:
         resp = safe_get(
             page_url,
             referer=post_url,
             timeout=HTTP_TIMEOUT,
+            stream=True,
         )
         resp.raise_for_status()
         if not is_public_http_url(resp.url):
-            return []
+            resp.close()
+            return [], []
         content_type = (resp.headers.get("Content-Type") or "").lower()
+        response_name = _response_filename(resp, "")
+        response_ext = Path(response_name).suffix.lower()
+        if content_type.startswith("image/") or ("octet-stream" in content_type and response_ext in IMAGE_EXTENSIONS):
+            direct_url = resp.url
+            resp.close()
+            return [direct_url], []
+        if content_type.startswith("video/") or ("octet-stream" in content_type and response_ext in VIDEO_EXTENSIONS):
+            direct_url = resp.url
+            resp.close()
+            return [], [direct_url]
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            return []
-        if len(resp.content) > 5 * 1024 * 1024:
-            return []
+            resp.close()
+            return [], []
+        body = resp.content
+        resp.close()
+        if len(body) > 5 * 1024 * 1024:
+            return [], []
     except requests.RequestException as exc:
         _mark_external_failure(exc)
-        return []
+        return [], []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    found: list[str] = []
-    seen: set[str] = set()
+    soup = BeautifulSoup(body, "html.parser")
+    images: list[str] = []
+    videos: list[str] = []
+    seen_images: set[str] = set()
+    seen_videos: set[str] = set()
 
-    def add_candidate(value: str | None) -> None:
+    def add_candidate(value: str | None, kind: str) -> None:
         if not value:
             return
         full = urljoin(resp.url, value.strip())
-        if full in seen or not is_public_http_url(full):
+        if not is_public_http_url(full):
             return
-        seen.add(full)
-        found.append(full)
+        if kind == "video":
+            if full in seen_videos:
+                return
+            seen_videos.add(full)
+            videos.append(full)
+        else:
+            if full in seen_images:
+                return
+            seen_images.add(full)
+            images.append(full)
 
-    # 페이지 대표/콘텐츠 이미지 메타데이터만 허용한다.
     for tag in soup.find_all("meta"):
         key = (tag.get("property") or tag.get("name") or "").strip().lower()
         if key in {"og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src"}:
-            add_candidate(tag.get("content"))
-            if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
-                return found
+            add_candidate(tag.get("content"), "image")
+        elif key in {"og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"}:
+            add_candidate(tag.get("content"), "video")
 
-    # 명시적인 대표 이미지 링크.
     for tag in soup.find_all("link", href=True):
         rel = {str(x).lower() for x in (tag.get("rel") or [])}
         if "image_src" in rel:
-            add_candidate(tag.get("href"))
-            if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
-                return found
+            add_candidate(tag.get("href"), "image")
 
-    # 페이지 내부에서 '이미지 파일 자체'로 직접 연결된 링크만 허용한다.
+    for tag in soup.find_all(["video", "source"]):
+        src = tag.get("src") or tag.get("data-src") or tag.get("data-original")
+        if src:
+            type_value = str(tag.get("type") or "").lower()
+            full = urljoin(resp.url, src)
+            ext = Path(urlparse(full).path).suffix.lower()
+            if type_value.startswith("video/") or ext in VIDEO_EXTENSIONS or tag.name == "video":
+                add_candidate(src, "video")
+
     for tag in soup.find_all("a", href=True):
         full = urljoin(resp.url, tag["href"])
-        if Path(urlparse(full).path).suffix.lower() in IMAGE_EXTENSIONS:
-            add_candidate(full)
-            if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
-                break
+        ext = Path(urlparse(full).path).suffix.lower()
+        if ext in IMAGE_EXTENSIONS:
+            add_candidate(full, "image")
+        elif ext in VIDEO_EXTENSIONS:
+            add_candidate(full, "video")
+        if len(images) >= MAX_EXTERNAL_IMAGES_PER_PAGE and len(videos) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
+            break
 
-    return found
+    return images[:MAX_EXTERNAL_IMAGES_PER_PAGE], videos[:MAX_EXTERNAL_IMAGES_PER_PAGE]
+
+
+def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
+    """기존 호출 호환용 이미지 전용 래퍼."""
+    images, _ = collect_external_page_media(page_url, post_url)
+    return images
 
 def _fuzzy_host_pattern(host: str) -> str:
     # 영숫자 사이에는 임의의 비영숫자(공백/이모지/슬래시/기호)를 허용한다.
@@ -1587,11 +1682,6 @@ def repair_obfuscated_known_url(value: str) -> str:
         https://go / file . io/d/abc -> https://gofile.io/d/abc
     """
     raw = str(value).strip()
-
-    # 사용자가 점(.)을 한글로 바꿔 적은 ImgBB 주소 복원.
-    # 예: https://ibb점co/abc, ibb쩜co/abc
-    raw = re.sub(r"(?i)ibb\s*(?:점|쩜)\s*co", "ibb.co", raw)
-
     scheme_match = re.match(r"^(https?://)", raw, re.IGNORECASE)
     if not scheme_match:
         return clean_detected_url(raw)
@@ -1634,17 +1724,6 @@ def repair_obfuscated_known_url(value: str) -> str:
 def extract_text_url_candidates(text: str) -> list[str]:
     """평문에서 일반 URL과 알려진 호스트의 가려진 URL을 함께 찾는다."""
     candidates = list(EXTERNAL_URL_RE.findall(text))
-
-    # `ibb점co` / `ibb쩜co`처럼 점을 한글로 쓴 주소도 후보에 넣는다.
-    # 스킴이 생략된 경우에는 HTTPS를 붙여 기존 외부링크 처리기로 넘긴다.
-    for match in re.finditer(
-        r"(?i)(?:https?://)?ibb\s*(?:점|쩜)\s*co(?:[/\?#][^\s<>\"']*)?",
-        str(text),
-    ):
-        candidate = match.group(0).strip()
-        if not re.match(r"(?i)^https?://", candidate):
-            candidate = "https://" + candidate
-        candidates.append(candidate)
 
     # 공백 때문에 일반 URL 정규식이 중간에서 끊기는 경우를 보완한다.
     # 알려진 호스트만 대상으로 해서 일반 문장을 URL로 오인하는 것을 줄인다.
@@ -1825,6 +1904,7 @@ def get_gofile_token() -> str | None:
     user_agent = str(get_session().headers.get("User-Agent", "Mozilla/5.0"))
     wt = generate_gofile_website_token(user_agent, "")
     try:
+        _wait_for_external_slot()
         resp = get_session().post(
             "https://api.gofile.io/accounts",
             headers={"X-Website-Token": wt, "X-BL": "en-US", "Origin": "https://gofile.io", "Referer": "https://gofile.io/"},
@@ -1849,20 +1929,24 @@ def extract_gofile_content_id(url: str) -> str | None:
     match = re.search(r"gofile\.io/d/([A-Za-z0-9_-]+)", url, re.IGNORECASE)
     return match.group(1) if match else None
 
-def collect_gofile_images(url: str) -> list[str]:
+def collect_gofile_media(url: str) -> tuple[list[str], list[str]]:
     content_id = extract_gofile_content_id(url)
     if not content_id:
-        return []
+        return [], []
     token = get_gofile_token()
     if not token:
-        return []
+        return [], []
 
     user_agent = str(get_session().headers.get("User-Agent", "Mozilla/5.0"))
-    found: list[str] = []
+    image_found: list[str] = []
+    video_found: list[str] = []
     visited: set[str] = set()
 
+    def total_found() -> int:
+        return len(image_found) + len(video_found)
+
     def walk(folder_id: str, depth: int) -> None:
-        if depth > GOFILE_MAX_DEPTH or folder_id in visited or len(found) >= GOFILE_MAX_FILES:
+        if depth > GOFILE_MAX_DEPTH or folder_id in visited or total_found() >= GOFILE_MAX_FILES:
             return
         visited.add(folder_id)
         wt = generate_gofile_website_token(user_agent, token)
@@ -1874,6 +1958,7 @@ def collect_gofile_images(url: str) -> list[str]:
             "Referer": "https://gofile.io/",
         }
         try:
+            _wait_for_external_slot()
             resp = get_session().get(
                 f"https://api.gofile.io/contents/{folder_id}",
                 params={"cache": "true", "sortField": "createTime", "sortDirection": "1"},
@@ -1897,7 +1982,7 @@ def collect_gofile_images(url: str) -> list[str]:
             return
 
         def handle(item: dict, next_depth: int) -> None:
-            if len(found) >= GOFILE_MAX_FILES:
+            if total_found() >= GOFILE_MAX_FILES:
                 return
             if item.get("type") == "folder":
                 child_id = str(item.get("id") or "")
@@ -1907,8 +1992,13 @@ def collect_gofile_images(url: str) -> list[str]:
             name = str(item.get("name") or "")
             mimetype = str(item.get("mimetype") or item.get("mimeType") or "").lower()
             link = str(item.get("link") or "")
-            if link and (mimetype.startswith("image/") or Path(name).suffix.lower() in IMAGE_EXTENSIONS):
-                found.append(link)
+            ext = Path(name).suffix.lower()
+            if not link:
+                return
+            if mimetype.startswith("image/") or ext in IMAGE_EXTENSIONS:
+                image_found.append(link)
+            elif mimetype.startswith("video/") or ext in VIDEO_EXTENSIONS:
+                video_found.append(link)
 
         if data.get("type") == "folder":
             children = data.get("children") or {}
@@ -1916,13 +2006,125 @@ def collect_gofile_images(url: str) -> list[str]:
             for child in iterable:
                 if isinstance(child, dict):
                     handle(child, depth + 1)
-                if len(found) >= GOFILE_MAX_FILES:
+                if total_found() >= GOFILE_MAX_FILES:
                     break
         elif isinstance(data, dict):
             handle(data, depth)
 
     walk(content_id, 0)
-    return list(dict.fromkeys(found))[:GOFILE_MAX_FILES]
+    return (
+        list(dict.fromkeys(image_found))[:GOFILE_MAX_FILES],
+        list(dict.fromkeys(video_found))[:GOFILE_MAX_FILES],
+    )
+
+
+def collect_gofile_images(url: str) -> list[str]:
+    """기존 호출 호환용 이미지 전용 래퍼."""
+    images, _ = collect_gofile_media(url)
+    return images
+
+def _response_filename(resp, fallback: str = "") -> str:
+    content_disposition = str(resp.headers.get("Content-Disposition") or "")
+    match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition, re.IGNORECASE)
+    if match:
+        return unquote(match.group(1).strip().strip('"'))
+    match = re.search(r'filename="?([^";]+)', content_disposition, re.IGNORECASE)
+    if match:
+        return unquote(match.group(1).strip())
+    raw = unquote(os.path.basename(urlparse(resp.url).path))
+    return raw or fallback
+
+
+def download_external_media_auto(
+    media_url: str,
+    referer: str,
+    save_dir: Path,
+    image_hashes: set[str],
+    post_budget: list[int],
+    index: int,
+    *,
+    name_key: str,
+) -> dict:
+    """확장자가 없는 외부 직링크를 Content-Type/파일명으로 이미지 또는 영상 판별해 한 번의 GET으로 저장한다."""
+    path = None
+    try:
+        with safe_get(
+            media_url,
+            referer=referer,
+            timeout=max(HTTP_TIMEOUT, 30),
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            raw_name = _response_filename(resp, f"media_{index:03d}")
+            ext = Path(raw_name).suffix.lower()
+
+            is_image = content_type.startswith("image/") or ("octet-stream" in content_type and ext in IMAGE_EXTENSIONS)
+            is_video = content_type.startswith("video/") or ("octet-stream" in content_type and ext in VIDEO_EXTENSIONS)
+            if not is_image and not is_video:
+                return {"images": 0, "videos": 0}
+
+            content_length = resp.headers.get("Content-Length")
+            if is_image and content_length and int(content_length) > MAX_IMAGE_BYTES:
+                logger.info("이미지 용량 제한 초과, 건너뜀: %s", media_url)
+                return {"images": 0, "videos": 0}
+
+            if is_image:
+                if ext not in IMAGE_EXTENSIONS:
+                    ext = extension_from_content_type(content_type)
+                path = next_image_path(save_dir, ext, name_key, index)
+            else:
+                if ext not in VIDEO_EXTENSIONS:
+                    ext = video_extension_from_content_type(content_type)
+                    raw_name = f"video_{index:03d}{ext}"
+                path = unique_path(save_dir, raw_name)
+
+            written = 0
+            while True:
+                try:
+                    stream_file = path.open('xb')
+                    break
+                except FileExistsError:
+                    path = unique_path(save_dir, path.name)
+            with stream_file as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if is_image and written > MAX_IMAGE_BYTES:
+                        raise ValueError("이미지 다운로드 용량 제한 초과")
+                    if post_budget[0] + written > MAX_POST_BYTES:
+                        raise ValueError("게시글 다운로드 용량 제한 초과")
+                    f.write(chunk)
+
+        if is_image:
+            image_hash = sha256_file(path)
+            if image_hash in EXCLUDED_IMAGE_HASHES:
+                path.unlink(missing_ok=True)
+                logger.info("제외 지정 이미지 삭제(SHA-256): %s", media_url)
+                return {"images": 0, "videos": 0}
+            if not _commit_image_hash(image_hash, image_hashes):
+                path.unlink(missing_ok=True)
+                logger.info("중복 이미지 제외(SHA-256): %s", media_url)
+                return {"images": 0, "videos": 0}
+            post_budget[0] += written
+            logger.info("이미지 저장: %s", path)
+            return {"images": 1, "videos": 0}
+
+        post_budget[0] += written
+        logger.info("영상 저장: %s", path)
+        return {"images": 0, "videos": 1}
+    except (requests.RequestException, OSError, ValueError) as exc:
+        try:
+            if path is not None and path.exists():
+                path.unlink()
+        except OSError:
+            pass
+        if isinstance(exc, requests.RequestException):
+            _mark_external_failure(exc)
+        logger.warning("외부 미디어 자동 판별 다운로드 실패: %s (%s)", media_url, exc)
+        return {"images": 0, "videos": 0}
+
 
 def _process_external_url_once(
     *,
@@ -1939,7 +2141,7 @@ def _process_external_url_once(
     comment_id: str = "",
     record_link: bool = True,
 ) -> dict:
-    """기존 공용 외부링크 처리. 재시도 시에는 외부링크 기록을 중복 추가하지 않는다."""
+    """기존 공용 외부링크 처리. 이미지 기능을 유지하면서 다운로드 가능한 영상도 함께 처리한다."""
     url = repair_obfuscated_known_url(url)
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -1976,43 +2178,77 @@ def _process_external_url_once(
         return {"images": 0, "videos": int(ok)}
 
     image_urls: list[str] = []
+    video_urls: list[str] = []
+    auto_urls: list[str] = []
     if host == "postimg.cc" or host.endswith(".postimg.cc") or host == "postimages.org" or host.endswith(".postimages.org"):
         image_urls = collect_postimages_images(url, referer)
     elif host == "ibb.co" or host.endswith(".ibb.co") or host == "imgbb.com" or host.endswith(".imgbb.com"):
         image_urls = collect_imgbb_images(url, referer)
     elif host == "gofile.io" or host.endswith(".gofile.io"):
-        image_urls = collect_gofile_images(url)
+        image_urls, video_urls = collect_gofile_media(url)
     elif host in {"drive.google.com", "docs.google.com", "drive.usercontent.google.com"}:
-        image_urls = collect_google_drive_images(url)
+        # 공개 Drive 파일은 확장자가 URL에 없을 수 있어 응답 Content-Type으로 판별한다.
+        auto_urls = collect_google_drive_images(url)
 
-    # 전용 처리기가 결과를 못 찾았으면 기존 범용 방식으로 한 번 더 시도한다.
-    if not image_urls:
-        image_urls = collect_external_page_images(url, referer)
+    # 전용 처리기가 결과를 못 찾았으면 범용 HTML/직접 미디어 방식으로 한 번만 확인한다.
+    generic_checked = False
+    if not image_urls and not video_urls and not auto_urls:
+        image_urls, video_urls = collect_external_page_media(url, referer)
+        generic_checked = True
 
-    saved = 0
+    saved_images = 0
+    saved_videos = 0
     for image_url in list(dict.fromkeys(image_urls))[:MAX_EXTERNAL_IMAGES_PER_PAGE]:
         if post_budget[0] >= MAX_POST_BYTES:
             break
         if download_image(image_url, url, save_dir, image_hashes, post_budget, image_index[0], name_key=image_name_key):
-            saved += 1
+            saved_images += 1
         image_index[0] += 1
 
-    # 전용 후보가 있었지만 실제 다운로드가 실패했다면 대표 이미지 fallback도 시도한다.
-    if saved == 0 and post_budget[0] < MAX_POST_BYTES:
-        fallback_urls = collect_external_page_images(url, referer)
-        for image_url in list(dict.fromkeys(fallback_urls))[:MAX_EXTERNAL_IMAGES_PER_PAGE]:
+    for video_url in list(dict.fromkeys(video_urls))[:MAX_EXTERNAL_IMAGES_PER_PAGE]:
+        if post_budget[0] >= MAX_POST_BYTES:
+            break
+        if download_video(video_url, url, save_dir, post_budget, image_index[0]):
+            saved_videos += 1
+        image_index[0] += 1
+
+    for media_url in list(dict.fromkeys(auto_urls))[:MAX_EXTERNAL_IMAGES_PER_PAGE]:
+        if post_budget[0] >= MAX_POST_BYTES:
+            break
+        result = download_external_media_auto(
+            media_url, url, save_dir, image_hashes, post_budget, image_index[0], name_key=image_name_key
+        )
+        saved_images += int(result.get("images", 0))
+        saved_videos += int(result.get("videos", 0))
+        image_index[0] += 1
+
+    # 전용 후보가 있었지만 실제 저장에 실패한 경우에만 범용 페이지 후보를 한 번 확인한다.
+    if (
+        saved_images == 0 and saved_videos == 0 and not generic_checked
+        and post_budget[0] < MAX_POST_BYTES
+    ):
+        fallback_images, fallback_videos = collect_external_page_media(url, referer)
+        for image_url in list(dict.fromkeys(fallback_images))[:MAX_EXTERNAL_IMAGES_PER_PAGE]:
             if image_url in image_urls or post_budget[0] >= MAX_POST_BYTES:
                 continue
             if download_image(image_url, url, save_dir, image_hashes, post_budget, image_index[0], name_key=image_name_key):
-                saved += 1
+                saved_images += 1
+            image_index[0] += 1
+        for video_url in list(dict.fromkeys(fallback_videos))[:MAX_EXTERNAL_IMAGES_PER_PAGE]:
+            if video_url in video_urls or post_budget[0] >= MAX_POST_BYTES:
+                continue
+            if download_video(video_url, url, save_dir, post_budget, image_index[0]):
+                saved_videos += 1
             image_index[0] += 1
 
-    if saved == 0:
+    if saved_images == 0 and saved_videos == 0:
         remove_empty_directory(save_dir)
 
-    logger.info("외부링크 처리 완료: source=%s domain=%s 이미지=%d | %s", source, host, saved, url)
-    return {"images": saved, "videos": 0}
-
+    logger.info(
+        "외부링크 처리 완료: source=%s domain=%s 이미지=%d 영상=%d | %s",
+        source, host, saved_images, saved_videos, url,
+    )
+    return {"images": saved_images, "videos": saved_videos}
 
 def _attempt_external_url(kwargs: dict, *, record_link: bool) -> tuple[dict, bool]:
     # Only transient network / 408 / 429 / 5xx errors cause a retry; absence of media
@@ -2258,6 +2494,7 @@ def check_tracked_post_comments(
                 key = f"{gallery_id}|{post_id}|{comment_id}|{url}"
                 if key in seen_comment_links:
                     continue
+                save_dir.mkdir(parents=True, exist_ok=True)
                 logger.info("새 댓글 링크 감지: post=%s comment=%s | %s", post_id, comment_id, url)
                 process_comment_url(
                     url, post_url, save_dir, image_hashes, post_budget, image_index,
@@ -2448,6 +2685,7 @@ def check_guestbooks(
 
         user_new_links = 0
         user_saved_images = 0
+        user_saved_videos = 0
         for entry in entries:
             key = str(entry["key"])
             if key in seen_guestbook_links:
@@ -2473,16 +2711,18 @@ def check_guestbooks(
             newly_seen += 1
             user_new_links += 1
             user_saved_images += int(result.get("images", 0))
+            user_saved_videos += int(result.get("videos", 0))
 
             if post_budget[0] >= MAX_POST_BYTES:
                 break
 
         if user_new_links:
             logger.info(
-                "방명록 처리 완료: gallog=%s 새 링크=%d 새 이미지=%d",
+                "방명록 처리 완료: gallog=%s 새 링크=%d 새 이미지=%d 새 영상=%d",
                 user,
                 user_new_links,
                 user_saved_images,
+                user_saved_videos,
             )
 
     if newly_seen:
@@ -2790,6 +3030,8 @@ class Notification(QThread):
         self.seen_guestbook_links = load_seen_guestbook_links()
         self.seen_comment_guestbook_triggers = load_seen_comment_guestbook_triggers()
         self.interest_users = load_guestbook_interest_users()
+        self.blocked_title_words = load_blocked_words(BLOCKED_TITLE_WORDS_FILE)
+        self.blocked_body_words = load_blocked_words(BLOCKED_BODY_WORDS_FILE)
         self.tracked_comment_posts = {}
         self.tracked_video_posts = {}
         self.tracked_guestbooks = {}
@@ -2931,11 +3173,12 @@ class Notification(QThread):
             f'추가 기능 준비: 관심작성자 {len(self.interest_users)}명 / '
             f'댓글 {COMMENT_POLL_SECONDS:.0f}초×{COMMENT_TRACK_SECONDS/60:.0f}분 / '
             f'방명록 {GUESTBOOK_WATCH_INTERVAL_SECONDS:.0f}초×{GUESTBOOK_WATCH_SECONDS/60:.0f}분 / '
-            f'영상 재확인 {VIDEO_RETRY_INTERVAL_SECONDS:.0f}초×최대 {VIDEO_RETRY_TRACK_SECONDS:.0f}초'
+            f'영상 재확인 {VIDEO_RETRY_INTERVAL_SECONDS:.0f}초×최대 {VIDEO_RETRY_TRACK_SECONDS:.0f}초 / '
+            f'제목 차단어 {len(self.blocked_title_words)}개 / 본문 차단어 {len(self.blocked_body_words)}개'
         )
         return True
 
-    def register_post_feature_tracking(self, row, title_f, author, post_id):
+    def register_post_feature_tracking(self, row, title_f, author, post_id, post_html=None):
         """새 게시글 1건에 댓글/방명록 추적을 등록한다. 기존 알림/키워드 판정과는 독립적이다."""
         writer_cell = row.find('td', class_='gall_writer')
         gallog_user = extract_gallog_user_from_element(writer_cell)
@@ -2943,7 +3186,6 @@ class Notification(QThread):
             f'추가기능 작성자 식별: post={post_id} author={author} gallog={gallog_user or "없음"}'
         )
         post_url = f'https://gall.dcinside.com{self.gallery_type}board/view?id={self.gallery_id}&no={post_id}'
-        post_html = None
 
         # 관심작성자는 새 글을 쓸 때마다 즉시 확인 + 30초 간격 10분 임시 감시.
         # 일반 작성자는 제목/본문의 방명록 암시 신호가 있을 때만 동일하게 감시한다.
@@ -3154,11 +3396,46 @@ class Notification(QThread):
 
                 title_f = f'{header} {title}'.strip().replace('\n', '\t')
 
-                # 기존 알림/키워드 동작은 그대로 두고, 추가 기능은 새 글당 한 번만 등록한다.
+                blocked_title_word = find_blocked_word(title_f, self.blocked_title_words)
+                if blocked_title_word:
+                    self.feature_seen_post_ids.add(post_id)
+                    self.recent = max(self.recent, post_id)
+                    if post_id > self.last_check:
+                        self.last_check = post_id
+                    self.logger.info(
+                        '차단 글 건너뜀(제목): post=%s author=%s word=%s',
+                        post_id, author, blocked_title_word,
+                    )
+                    continue
+
+                # 본문 차단은 게시글을 한 번만 열어 확인하고, 이후 기존 기능도 같은 HTML을 재사용한다.
                 feature_post_html = None
+                if self.blocked_body_words:
+                    post_url = f'https://gall.dcinside.com{self.gallery_type}board/view?id={self.gallery_id}&no={post_id}'
+                    feature_post_html = get_html_text(post_url)
+                    if feature_post_html:
+                        blocked_body_word = find_blocked_word(
+                            extract_post_content_text(feature_post_html), self.blocked_body_words
+                        )
+                        if blocked_body_word:
+                            self.feature_seen_post_ids.add(post_id)
+                            self.recent = max(self.recent, post_id)
+                            if post_id > self.last_check:
+                                self.last_check = post_id
+                            self.logger.info(
+                                '차단 글 건너뜀(본문): post=%s author=%s word=%s',
+                                post_id, author, blocked_body_word,
+                            )
+                            continue
+                    else:
+                        self.logger.warning('본문 차단어 확인용 게시글 조회 실패: post=%s - 기존 처리 계속', post_id)
+
+                # 기존 알림/키워드 동작은 그대로 두고, 추가 기능은 새 글당 한 번만 등록한다.
                 if post_id not in self.feature_seen_post_ids:
                     self.feature_seen_post_ids.add(post_id)
-                    feature_post_html = self.register_post_feature_tracking(n, title_f, author, post_id)
+                    feature_post_html = self.register_post_feature_tracking(
+                        n, title_f, author, post_id, post_html=feature_post_html
+                    )
 
                 if post_id > self.last_check:
                     self.last_check = post_id
@@ -3221,7 +3498,6 @@ class Notification(QThread):
         self.flag = False
         _external_retry_queue.clear()
 
-
 # ===== GitHub Actions entrypoint =====
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -3283,7 +3559,7 @@ def run_github():
         '--run-seconds',
         type=int,
         default=int(os.getenv('DC_MONITOR_RUN_SECONDS', '0') or 0),
-        help='0이면 외부에서 종료될 때까지 실행. GitHub workflow는 기본 20700초(5시간45분)로 설정.',
+        help='0이면 외부에서 종료될 때까지 실행. GitHub workflow는 기본 18000초(5시간)로 설정.',
     )
     args = parser.parse_args()
 
