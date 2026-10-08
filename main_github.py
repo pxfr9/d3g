@@ -62,7 +62,6 @@ MAX_EXTERNAL_IMAGES_PER_PAGE = int(os.getenv('MAX_EXTERNAL_IMAGES_PER_PAGE', '30
 MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', str(20 * 1024 * 1024)))
 MAX_POST_BYTES = int(os.getenv('MAX_POST_BYTES', str(200 * 1024 * 1024)))
 HTTP_TIMEOUT = int(os.getenv('HTTP_TIMEOUT', '10'))
-EXTERNAL_REQUEST_INTERVAL_SECONDS = max(0.1, float(os.getenv('EXTERNAL_REQUEST_INTERVAL_SECONDS', '2')))
 
 # 게시글 영상 인코딩 지연 대응: 2초 간격, 최대 60초
 VIDEO_RETRY_INTERVAL_SECONDS = max(1.0, float(os.getenv('VIDEO_RETRY_INTERVAL_SECONDS', '2')))
@@ -379,33 +378,6 @@ def _wait_for_gallery_slot(active=lambda: True) -> bool:
             break
         time.sleep(min(0.1, remaining))
     return bool(active())
-
-def _reserve_external_request() -> float:
-    """외부사이트 HTTP 요청 시작 시각을 PC의 여러 수집기끼리도 공유해 분산한다."""
-    path = SHARED_DIR / 'external_reservation.json'
-    with _file_lock(SHARED_DIR / 'external_reservation.lock'):
-        state = _shared_read(path)
-        now = time.time()
-        next_slot = float(state.get('next_slot', 0))
-        # 비정상 종료/시계 변경으로 오래된 예약이 남은 경우 폐기한다.
-        if next_slot - now > max(60.0, EXTERNAL_REQUEST_INTERVAL_SECONDS * 10):
-            next_slot = now
-        slot = max(now, next_slot)
-        _shared_write(path, {'next_slot': slot + EXTERNAL_REQUEST_INTERVAL_SECONDS})
-        return max(0.0, slot - now)
-
-
-def _wait_for_external_slot() -> None:
-    delay = _reserve_external_request()
-    if delay <= 0:
-        return
-    deadline = time.monotonic() + delay
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(0.1, remaining))
-
 
 def _mark_external_failure(exc: Exception) -> None:
     if not getattr(_external_request_context, 'active', False):
@@ -1123,9 +1095,6 @@ def safe_get(url: str, *, referer: str | None = None, timeout: int | float = HTT
             raise requests.RequestException(f"비공개/사설 주소 요청 차단: {current}")
 
         try:
-            current_host = (urlparse(current).hostname or "").lower()
-            if not is_dcinside_host(current_host):
-                _wait_for_external_slot()
             resp = get_session().get(
                 current,
                 headers=headers or None,
@@ -1904,7 +1873,6 @@ def get_gofile_token() -> str | None:
     user_agent = str(get_session().headers.get("User-Agent", "Mozilla/5.0"))
     wt = generate_gofile_website_token(user_agent, "")
     try:
-        _wait_for_external_slot()
         resp = get_session().post(
             "https://api.gofile.io/accounts",
             headers={"X-Website-Token": wt, "X-BL": "en-US", "Origin": "https://gofile.io", "Referer": "https://gofile.io/"},
@@ -1958,7 +1926,6 @@ def collect_gofile_media(url: str) -> tuple[list[str], list[str]]:
             "Referer": "https://gofile.io/",
         }
         try:
-            _wait_for_external_slot()
             resp = get_session().get(
                 f"https://api.gofile.io/contents/{folder_id}",
                 params={"cache": "true", "sortField": "createTime", "sortDirection": "1"},
