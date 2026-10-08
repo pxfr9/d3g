@@ -64,7 +64,9 @@ jobs:
           ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
         run: |
           if [ -f .dc-monitor-state.7z ]; then
-            7z x -y -p"$ZIP_PASSWORD" .dc-monitor-state.7z -o. >/dev/null
+            7z x -y -p"$ZIP_PASSWORD" .dc-monitor-state.7z \
+              '-xr!data/blocked_title_words.txt' \
+              '-xr!data/blocked_body_words.txt' -o. >/dev/null
             rm -f .dc-monitor-state.7z
           fi
 
@@ -332,7 +334,11 @@ jobs:
               if not local_data.is_dir():
                   local_data.mkdir(parents=True, exist_ok=True)
               subprocess.run(
-                  ['7z', 'a', '-t7z', '-mx=5', '-mhe=on', f'-p{password}', str(archive), 'data'],
+                  [
+                      '7z', 'a', '-t7z', '-mx=5', '-mhe=on', f'-p{password}',
+                      '-xr!data/blocked_title_words.txt', '-xr!data/blocked_body_words.txt',
+                      str(archive), 'data',
+                  ],
                   check=True,
                   stdout=subprocess.DEVNULL,
               )
@@ -369,81 +375,90 @@ jobs:
 
       - name: Scan downloaded files with ClamAV
         if: always()
+        continue-on-error: true
+        timeout-minutes: 10
         run: |
           # 다운로드 결과가 없으면 검사할 필요가 없습니다.
-          if [ ! -d downloads ]; then
-            echo "검사할 downloads 폴더가 없습니다."
+          if [ ! -d downloads ] || ! find downloads -type f -print -quit 2>/dev/null | grep -q .; then
+            echo "검사할 downloads 파일이 없습니다."
             exit 0
           fi
 
-          # ClamAV 설치 실패 자체가 기존 Artifact 생성을 막지는 않도록 합니다.
+          # 각 명령에 별도 제한을 둬 ClamAV 한 단계가 Job 전체를 붙잡지 않게 합니다.
           if ! command -v clamscan >/dev/null 2>&1; then
-            sudo apt-get update -qq || {
-              echo "::warning::ClamAV 패키지 목록 갱신에 실패했습니다. 악성코드 검사를 건너뜁니다."
+            if ! timeout --signal=TERM --kill-after=10s 60s sudo apt-get update -qq; then
+              echo "::warning::ClamAV 패키지 목록 갱신이 실패/시간초과되어 악성코드 검사를 건너뜁니다."
               exit 0
-            }
-            sudo apt-get install -y clamav || {
-              echo "::warning::ClamAV 설치에 실패했습니다. 악성코드 검사를 건너뜁니다."
+            fi
+            if ! timeout --signal=TERM --kill-after=10s 120s sudo apt-get install -y clamav; then
+              echo "::warning::ClamAV 설치가 실패/시간초과되어 악성코드 검사를 건너뜁니다."
               exit 0
-            }
+            fi
           fi
 
-          # 최신 탐지 DB 갱신을 시도합니다. 갱신 실패 시 설치되어 있는 DB로 계속 검사합니다.
-          sudo freshclam >/dev/null 2>&1 || \
-            echo "::warning::ClamAV 탐지 DB 갱신에 실패했습니다. 현재 설치된 DB로 검사합니다."
+          # DB 갱신은 최대 90초. 실패해도 현재 DB로 실제 검사는 계속합니다.
+          if ! timeout --signal=TERM --kill-after=10s 90s sudo freshclam >/dev/null 2>&1; then
+            echo "::warning::ClamAV 탐지 DB 갱신이 실패/시간초과되었습니다. 현재 설치된 DB로 검사합니다."
+          fi
 
           rm -rf .quarantine .clamav-scan.log
           mkdir -p .quarantine
 
-          # 감염 파일은 downloads/ 밖으로 이동해 Artifact에서 제외합니다.
+          # 실제 검사는 최대 5분. 감염 파일은 기존처럼 Artifact에서 제외합니다.
           set +e
-          clamscan -r --infected --move=.quarantine downloads > .clamav-scan.log 2>&1
+          timeout --signal=TERM --kill-after=15s 300s \
+            clamscan -r --infected --move=.quarantine downloads > .clamav-scan.log 2>&1
           SCAN_RESULT=$?
           set -e
 
-          if [ "$SCAN_RESULT" -eq 1 ]; then
+          if [ "$SCAN_RESULT" -eq 0 ]; then
+            echo "ClamAV 검사 완료: 탐지된 악성코드 없음"
+          elif [ "$SCAN_RESULT" -eq 1 ]; then
             INFECTED_COUNT=$(grep -c ' FOUND$' .clamav-scan.log 2>/dev/null || true)
             echo "::warning::ClamAV가 악성코드 ${INFECTED_COUNT}개를 탐지해 해당 파일만 Artifact에서 제외했습니다."
-          elif [ "$SCAN_RESULT" -gt 1 ]; then
-            echo "::warning::ClamAV 검사 중 오류가 발생했습니다(종료코드: $SCAN_RESULT). 기존 Artifact 생성은 계속합니다."
+          elif [ "$SCAN_RESULT" -eq 124 ]; then
+            echo "::warning::ClamAV 검사가 5분을 넘어 중단되었습니다. 검사된 결과만 반영하고 암호화/Artifact 처리를 계속합니다."
           else
-            echo "ClamAV 검사 완료: 탐지된 악성코드 없음"
+            echo "::warning::ClamAV 검사 중 오류가 발생했습니다(종료코드: $SCAN_RESULT). 암호화/Artifact 처리는 계속합니다."
           fi
 
           # 격리 파일과 검사 로그는 결과물에 포함하지 않고 즉시 삭제합니다.
           rm -rf .quarantine .clamav-scan.log
 
       - name: Encrypt collected files
+        id: encrypt_collected
         if: always()
         env:
           ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
         run: |
           set -e
+          echo "has_media=false" >> "$GITHUB_OUTPUT"
           if [ -z "$ZIP_PASSWORD" ]; then
             echo "::error::ZIP_PASSWORD가 없어 결과물을 암호화할 수 없습니다."
             exit 1
           fi
 
-          # 다운로드 결과에는 downloads/만 포함합니다. data/와 로그는 Artifact에 넣지 않습니다.
-          # 중복/제외 이미지 처리 후 남은 빈 작성자 폴더도 최종적으로 제거합니다.
+          # 중복/제외/격리 처리 후 남은 빈 작성자 폴더를 정리합니다.
           if [ -d downloads ]; then
             find downloads -depth -type d -empty -delete
           fi
 
-          items=()
-          [ -d downloads ] && items+=(downloads)
-
-          if [ ${#items[@]} -eq 0 ]; then
-            mkdir -p .empty-result
-            printf '수집된 파일이 없습니다.\n' > .empty-result/README.txt
-            items+=(.empty-result)
+          # 실제 이미지/영상이 하나도 없으면 빈 7z와 Artifact를 만들지 않습니다.
+          MEDIA_FILE=$(find downloads -type f \
+            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \
+               -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.mp4' -o -iname '*.webm' \
+               -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' -o -iname '*.m4v' \) \
+            -print -quit 2>/dev/null || true)
+          if [ -z "$MEDIA_FILE" ]; then
+            rm -f "dc-monitor-${{ github.run_id }}.7z"
+            echo "저장된 이미지/영상이 없어 결과 압축파일과 Artifact를 생성하지 않습니다."
+            exit 0
           fi
 
           # 7z AES-256 + 헤더 암호화(-mhe=on): 파일 내용뿐 아니라 파일명/폴더명도 암호 없이는 보이지 않게 합니다.
           7z a -t7z -mx=7 -mhe=on -p"$ZIP_PASSWORD" \
-            "dc-monitor-${{ github.run_id }}.7z" "${items[@]}" >/dev/null
-
-          rm -rf .empty-result
+            "dc-monitor-${{ github.run_id }}.7z" downloads >/dev/null
+          echo "has_media=true" >> "$GITHUB_OUTPUT"
 
       - name: Encrypt monitor state for next run
         if: always()
@@ -453,7 +468,10 @@ jobs:
           set -e
           rm -f .dc-monitor-state.7z
           if [ -d data ] && [ -n "$ZIP_PASSWORD" ]; then
-            7z a -t7z -mx=5 -mhe=on -p"$ZIP_PASSWORD" .dc-monitor-state.7z data >/dev/null
+            7z a -t7z -mx=5 -mhe=on -p"$ZIP_PASSWORD" \
+              '-xr!data/blocked_title_words.txt' \
+              '-xr!data/blocked_body_words.txt' \
+              .dc-monitor-state.7z data >/dev/null
           fi
 
       - name: Remove plaintext collected files from workspace
@@ -462,7 +480,7 @@ jobs:
           rm -rf downloads data Notification.log
 
       - name: Upload encrypted collected files
-        if: always()
+        if: ${{ always() && steps.encrypt_collected.outputs.has_media == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: dc-monitor-${{ github.run_id }}-encrypted
